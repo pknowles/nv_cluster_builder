@@ -118,7 +118,7 @@ struct Split
   float       cost          = std::numeric_limits<float>::max();
   bool        leftComplete  = false;  // the left child is a valid cluster
   bool        rightComplete = false;  // the right child is a valid cluster
-  inline bool valid() { return axis != std::numeric_limits<uint32_t>::max(); }
+  inline bool valid() const { return axis != std::numeric_limits<uint32_t>::max(); }
   bool        operator<(const Split& other) const { return cost < other.cost; }
 };
 
@@ -669,20 +669,18 @@ inline void partitionAtSplit(const std::array<std::span<uint32_t>, 3>& nodeItems
 // the number of items in each node is less than or equal to maxItemsPerNode.
 template <bool Parallelize>
 static void splitAtMedianUntil(const Input& spatial,  // Original definition of the input spatial items
+                               NodeRange    node,     // Node range to split, including a segment index
+                               const std::array<std::span<uint32_t>, 3>& nodeItems,  // Sorted item indices within the node along each axis
+                               uint32_t maxItemsPerNode,  // Maximum number of items allowed per node, used to stop the recursion
                                std::vector<uint8_t>& partitionSides,  // Partition identifier (left = 1, right = 0) for each item, used to partition the sorted item lists
-                               const std::array<std::span<uint32_t>, 3>& nodeItems,  // Sorted item indices along each axis for the current node
-                               size_t maxItemsPerNode,  // Maximum number of items allowed per node, used to stop the recursion
-                               uint32_t nodeStartIndex,  // Starting index of the node in the complete sorted lists of items
-                               uint32_t segmentIndex,  // Index of the segment this node was split from
                                std::vector<NodeRange>& nodeItemRanges  // Output ranges of the nodes (in the sorted item lists) created by the recursive split
 )
 {
-  uint32_t nodeItemCount = uint32_t(nodeItems[0].size());
-
-  // If the current node is smaller than the maximum allowed item count, return its range
-  if(nodeItemCount < maxItemsPerNode)
+  // If the current node is within the maximum allowed item count, write its
+  // range and stop recursion
+  if(node.count <= maxItemsPerNode)
   {
-    nodeItemRanges.push_back(NodeRange{nodeStartIndex, nodeItemCount, segmentIndex});
+    nodeItemRanges.push_back(node);
     return;
   }
 
@@ -700,24 +698,26 @@ static void splitAtMedianUntil(const Input& spatial,  // Original definition of 
   uint32_t axis = size[0] > size[1] && size[0] > size[2] ? 0u : (size[1] > size[2] ? 1u : 2u);
 
   // Split the sorted item vectors at the median, preserving the order along each axis
-  uint32_t splitPosition = nodeItemCount / 2;
+  uint32_t splitPosition = node.count / 2;
   partitionAtSplit<Parallelize>(nodeItems, axis, splitPosition, partitionSides);
 
   // Extract the left and right halves of the sorted item lists
-  auto left  = std::to_array({
+  NodeRange leftNode   = {{0, splitPosition}, node.segment};
+  auto      leftItems  = std::to_array({
       nodeItems[0].subspan(0, splitPosition),
       nodeItems[1].subspan(0, splitPosition),
       nodeItems[2].subspan(0, splitPosition),
   });
-  auto right = std::to_array({
+  NodeRange rightNode  = {{splitPosition, node.count - splitPosition}, node.segment};
+  auto      rightItems = std::to_array({
       nodeItems[0].subspan(splitPosition),
       nodeItems[1].subspan(splitPosition),
       nodeItems[2].subspan(splitPosition),
   });
+
   // Continue the split recursively on the left and right halves
-  splitAtMedianUntil<Parallelize>(spatial, partitionSides, left, maxItemsPerNode, nodeStartIndex, segmentIndex, nodeItemRanges);
-  splitAtMedianUntil<Parallelize>(spatial, partitionSides, right, maxItemsPerNode, nodeStartIndex + splitPosition,
-                                  segmentIndex, nodeItemRanges);
+  splitAtMedianUntil<Parallelize>(spatial, leftNode, leftItems, maxItemsPerNode, partitionSides, nodeItemRanges);
+  splitAtMedianUntil<Parallelize>(spatial, rightNode, rightItems, maxItemsPerNode, partitionSides, nodeItemRanges);
 }
 
 // Find the lowest cost split on any axis, perform the split (partition
@@ -744,6 +744,7 @@ Split splitNode(const Input&         input,  // Input items and connections
 
   // Split (before the indexed element) should be after the first and before the
   // last. Assert because we don't want to pay for this check in release.
+  // NOTE: this can actually fail if the computed cost is always inf, e.g. bad user AABBs
   assert(split.position > 0 && split.position < node.range.count);
 
   // Split the node at the chosen axis and position
@@ -1089,7 +1090,7 @@ nvcluster_Result clusterize(const Input& input, const OutputClusters& clusters)
   // BVH style recursive bisection. Split nodes recursively until they have the
   // desired number of items. Unlike a BVH build, the hierarchy is not stored
   // and leaf nodes are immediately emitted as clusters. The current list of
-  // nodes is double buffered nodes for each level.
+  // nodes is double buffered to process each level of recursion.
   std::vector<NodeRange> nodeItemRangesCurrent, nodeItemRangesNext;
   size_t                 maxNodes = (2 * itemCount) / input.config.maxClusterSize;
   if(HasVertexLimit)
@@ -1103,31 +1104,33 @@ nvcluster_Result clusterize(const Input& input, const OutputClusters& clusters)
   nodeItemRangesCurrent.reserve(maxNodes);
   nodeItemRangesNext.reserve(maxNodes);
 
-  uint32_t sanitizedPreSplitThreshold = std::max(input.config.preSplitThreshold, input.config.maxClusterSize * 2);
-  if(input.config.preSplitThreshold == 0 || itemCount < sanitizedPreSplitThreshold)
-  {
-    // Segments become root nodes to be split
-    for(uint32_t i = 0; i < input.segments.size(); i++)
-    {
-      nodeItemRangesCurrent.push_back(NodeRange{input.segments[i].offset, input.segments[i].count, i});
-    }
-  }
-  else
+  // Initialize root nodes containing items in each segment. If any are larger
+  // than the preSplitThreshold, create child nodes by performing simple median
+  // splits until they are smaller than the threshold. This improves performance
+  // by avoiding computing split costs with a mild quality penalty. Sanitize the
+  // threshold to avoid making more clusters than the user allocated for.
+  uint32_t sanitizedPreSplitThreshold = std::max(input.config.preSplitThreshold, input.config.maxClusterSize);
+  uint32_t allowedUnderflow           = 0;
   {
     Stopwatch swSplitMedian("splitMedian");
-    // Performance optimization. If there are more than preSplitThreshold items in the root node,
-    // create child nodes by performing simple median splits on the input item lists until each node contains a maximum of sanitizedPreSplitThreshold items.
-    // This reduces the overally computational cost of the BVH build by applying the more accurate (and costly) node splitting algorithm only on smaller nodes.
     for(uint32_t segmentIndex = 0; segmentIndex < input.segments.size(); segmentIndex++)
     {
-      Range segment      = input.segments[segmentIndex];
-      auto  segmentItems = std::to_array({
-          nodeItems[0].subspan(segment.offset, segment.count),
-          nodeItems[1].subspan(segment.offset, segment.count),
-          nodeItems[2].subspan(segment.offset, segment.count),
-      });
-      splitAtMedianUntil<Parallelize>(input, partitionSides, segmentItems, sanitizedPreSplitThreshold, segment.offset,
-                                      segmentIndex, nodeItemRangesCurrent);
+      Range segment = input.segments[segmentIndex];
+      allowedUnderflow += input.config.preSplitThreshold == 0 ? 1 : div_ceil(segment.count, sanitizedPreSplitThreshold);
+      if(input.config.preSplitThreshold == 0 || segment.count <= sanitizedPreSplitThreshold)
+      {
+        nodeItemRangesCurrent.push_back(NodeRange{segment, segmentIndex});
+      }
+      else
+      {
+        auto segmentItems = std::to_array({
+            nodeItems[0].subspan(segment.offset, segment.count),
+            nodeItems[1].subspan(segment.offset, segment.count),
+            nodeItems[2].subspan(segment.offset, segment.count),
+        });
+        splitAtMedianUntil<Parallelize>(input, {segment, segmentIndex}, segmentItems, sanitizedPreSplitThreshold,
+                                        partitionSides, nodeItemRangesCurrent);
+      }
     }
   }
 
@@ -1173,6 +1176,12 @@ nvcluster_Result clusterize(const Input& input, const OutputClusters& clusters)
       }
     }
 
+    // Double check there is space for the next level of nodes, just in case
+    // the initial reservation for the common case wasn't enough.
+    if(nodeItemRangesNext.capacity() < nodeItemRangesCurrent.size() * 2)
+      nodeItemRangesNext.reserve(nodeItemRangesCurrent.size() * 2);
+
+    // Allocate new nodes with nodesNextAlloc, possibly atomically
     uint32_t nodesNextAlloc = 0;
     nodeItemRangesNext.resize(nodeItemRangesNext.capacity());  // conservative over-allocation
     NodeOutput nodeOutput{NextNodeBatch{nodeItemRangesNext, nodesNextAlloc}, completeNodeOutput};
@@ -1184,12 +1193,12 @@ nvcluster_Result clusterize(const Input& input, const OutputClusters& clusters)
         std::max(1u, nodeItemRangesCurrent[0].count > 100000 ? std::thread::hardware_concurrency() :
                                                                std::thread::hardware_concurrency() / 4u);
 
+#if _MSC_VER
     // Add an exception for small nodes if compiled with MSVC, where parallel
     // execution doesn't perform well with small batches.
-    #if _MSC_VER
-    if (nodeItemRangesCurrent[0].count < 4096)
-        nodeCountThreshold = 0;
-    #endif
+    if(nodeItemRangesCurrent[0].count < 4096)
+      nodeCountThreshold = 0;
+#endif
 
     bool parallelizeInternally = nodeItemRangesCurrent.size() <= nodeCountThreshold;
     if(!Parallelize || parallelizeInternally)
@@ -1221,9 +1230,8 @@ nvcluster_Result clusterize(const Input& input, const OutputClusters& clusters)
   }
 
   // It is possible to have less than the minimum number of items per cluster,
-  // but there should be at most one, unless pre-splitting or the vertex limit
+  // but there should be at most one per segment, unless pre-splitting or the vertex limit
   // is used.
-  uint32_t allowedUnderflow = input.config.preSplitThreshold == 0 ? 1 : div_ceil(itemCount, sanitizedPreSplitThreshold);
   if(!HasVertexLimit && completeNodeOutput.getClusterUnderflowCount() > allowedUnderflow)
   {
     return nvcluster_Result::NVCLUSTER_ERROR_INTERNAL_MULTIPLE_UNDERFLOW;

@@ -143,6 +143,36 @@ TEST(Config, PresplitCount)
   }
 }
 
+TEST(Config, PresplitSegmented)
+{
+  std::vector<nvcluster_AABB>  boundingBoxes(2001, {{0.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 1.0f}});
+  std::vector<nvcluster_Vec3f> centroids(2001, {0.0f, 0.0f, 0.0f});
+  std::vector<nvcluster_Range> segmentRanges{{0, 1}, {1, 1000}, {1001, 1000}};
+  nvcluster_Input              input{
+                   .itemBoundingBoxes = boundingBoxes.data(),
+                   .itemCentroids     = centroids.data(),
+                   .itemCount         = 2001,
+  };
+  nvcluster_Segments segments{
+      .segmentItemRanges = segmentRanges.data(),
+      .segmentCount      = 3,
+  };
+  nvcluster_Config config{
+      .minClusterSize    = 1,
+      .maxClusterSize    = 500,
+      .preSplitThreshold = 500,  // split both 1000 segments once
+  };
+  nvcluster::SegmentedClusterStorage clustering;
+  nvcluster_Result result = nvcluster::generateSegmentedClusters(ScopedContext(), config, input, segments, clustering);
+  ASSERT_EQ(result, nvcluster_Result::NVCLUSTER_SUCCESS);
+  EXPECT_EQ(clustering.segmentClusterRanges.size(), 3);
+  EXPECT_EQ(clustering.items.size(), 2001);
+
+  // Two of three segments should be split once. This doesn't guarantee
+  // pre-splitting has happened but should exercise the code path in practice.
+  EXPECT_EQ(clustering.clusterItemRanges.size(), 5);
+}
+
 TEST(Config, VertexLimitedCount)
 {
   {
