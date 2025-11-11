@@ -1,5 +1,12 @@
 # nv_cluster_builder
 
+> [!IMPORTANT]
+> This repository has been archived and is no longer maintained by NVIDIA. It
+> was the result of R&D for ray tracing optimized clusters. Some core algorithm
+> concepts have been adopted and further optimized in [meshoptimizer's
+> `meshopt_buildMeshletsSpatial()`](https://github.com/zeux/meshoptimizer), to
+> which we refer interested developers.
+
 **nv_cluster_builder** is a small generic spatial clustering C++ library,
 created to cluster triangle meshes for ray tracing. It is very similar to a
 recursive node splitting algorithm to create a bounding volume hierarchy (BVH).
