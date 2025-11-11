@@ -1,11 +1,13 @@
 # nv_cluster_builder
 
-> [!IMPORTANT]
-> This repository has been archived and is no longer maintained by NVIDIA. It
-> was the result of R&D for ray tracing optimized clusters. Some core algorithm
-> concepts have been adopted and further optimized in [meshoptimizer's
-> `meshopt_buildMeshletsSpatial()`](https://github.com/zeux/meshoptimizer), to
-> which we refer interested developers.
+> [!NOTE]
+> **This repository is now independently maintained by me, one of the original
+> NVIDIA developers.** It is forked from the original
+> [nv_cluster_builder](https://github.com/nvpro-samples/nv_cluster_builder).
+> Users are welcome to submit issues, pull requests, and suggestions. For an
+> alternative, some core algorithm concepts have also been adopted and optimized
+> in meshoptimizer's triangle-specific
+> [`meshopt_buildMeshletsSpatial()`](https://github.com/zeux/meshoptimizer).
 
 **nv_cluster_builder** is a small generic spatial clustering C++ library,
 created to cluster triangle meshes for ray tracing. It is very similar to a
