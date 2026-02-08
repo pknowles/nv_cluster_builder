@@ -929,13 +929,13 @@ struct NodeOutput
   template <bool ThreadSafe>
   void emitSplit(const NodeRange& node, const Split& split)
   {
-    NodeRange left{node.offset, split.position, node.segment};
+    NodeRange left{{node.offset, split.position}, node.segment};
     if(split.leftComplete)
       complete.push<ThreadSafe>(left);
     else
       nextBatch.push<ThreadSafe>(left);
 
-    NodeRange right{node.offset + split.position, node.count - split.position, node.segment};
+    NodeRange right{{node.offset + split.position, node.count - split.position}, node.segment};
     if(split.rightComplete)
       complete.push<ThreadSafe>(right);
     else
