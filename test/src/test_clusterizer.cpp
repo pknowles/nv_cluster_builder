@@ -1520,7 +1520,7 @@ TEST(ParallelAlgorithms, TransformExclusiveScanIsParallel)
                                     std::lock_guard<std::mutex> lock(mtx);
                                     thread_ids.insert(std::this_thread::get_id());
                                   }
-                                  return data[x];
+                                  return data[static_cast<size_t>(x)];
                                 });
 
   EXPECT_GE(thread_ids.size(), 2u);
